@@ -4,9 +4,9 @@ import random
 import json
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Загружаем переменные из .env (токен)
+# ========== ЗАГРУЗКА ПЕРЕМЕННЫХ ==========
 load_dotenv()
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
@@ -18,12 +18,10 @@ logger = logging.getLogger(__name__)
 
 # ========== ЗАГРУЗКА ФРАЗ ИЗ JSON ==========
 def load_phrases():
-    """Загружает фразы из JSON-файла и возвращает словарь {число: фраза}"""
     try:
         with open('phrases.json', 'r', encoding='utf-8') as f:
             phrases = json.load(f)
-        # Превращаем ключи из строк обратно в числа
-        return {int(key): value for key, value in phrases.items()}
+        return {int(k): v for k, v in phrases.items()}
     except FileNotFoundError:
         logger.error("Файл phrases.json не найден! Использую стандартные фразы.")
         return {}
@@ -31,29 +29,47 @@ def load_phrases():
         logger.error("Ошибка в формате phrases.json! Использую стандартные фразы.")
         return {}
 
-# Загружаем фразы один раз при старте
 PHRASES = load_phrases()
 
-# Проверяем, что токен есть
+# ========== ПРОВЕРКА ТОКЕНА ==========
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Токен не найден! Проверь файл .env или переменную окружения BOT_TOKEN.")
 
-# ---- Функции-обработчики команд ----
+# ========== НАСТРОЙКИ РЕЖИМА МАСТЕРА ==========
+# ВСТАВЬ СВОЙ TELEGRAM ID ПОСЛЕ ПОЛУЧЕНИЯ ЧЕРЕЗ /myid
+GAME_MASTER_ID = None   # Замени None на число, например 123456789
+
+# Состояние режима мастера (меняется только мастером)
+master_active = False
+master_bias = 0          # смещение: от -5 до +5, влияет на все броски
+
+# ========== ФУНКЦИИ-КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я кубик d20. Напиши /roll, чтобы бросить."
     )
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает ID пользователя (нужно для настройки мастера)"""
+    user_id = update.effective_user.id
+    await update.message.reply_text(f"Твой Telegram ID: `{user_id}`", parse_mode='Markdown')
+
 async def roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name
-    result = random.randint(1, 20)
 
-    # Пытаемся получить фразу из словаря PHRASES (из JSON)
+    # Применяем режим мастера (если активен) ко ВСЕМ броскам
+    if master_active:
+        base = random.randint(1, 20)
+        result = base + master_bias
+        result = max(1, min(20, result))   # ограничиваем 1..20
+    else:
+        result = random.randint(1, 20)
+
+    # Получаем фразу
     phrase = PHRASES.get(result)
-
-    # Если фразы нет — используем запасной вариант (встроенные фразы)
     if not phrase:
+        # запасные фразы (на случай, если нет JSON)
         if result == 1:
             phrase = "💥💥 Критическая неудача! Всё пошло не по плану.\nАтака: Атака промахнулась! Вместо атаки по врагу, ты нанёс себе малейший урон.\nДействие: Действие не удалось произвести, либо ты сделал его ужасно!"
         elif result == 20:
@@ -74,16 +90,53 @@ async def roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-# ---- Главная функция запуска ----
+# ========== СКРЫТЫЕ КОМАНДЫ МАСТЕРА (обрабатываются как обычные сообщения) ==========
+async def secret_master_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения (не команды) и реагирует на секретные команды мастера."""
+    global master_active, master_bias
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # Если сообщение не от мастера — игнорируем
+    if user_id != GAME_MASTER_ID:
+        return
+
+    # Секретные команды:
+    if text == "!mastermode on":
+        master_active = True
+        master_bias = 0
+        await update.message.reply_text("✅ Режим мастера активирован. Используй:\n!bias +5\n!bias -5\n!bias 0\n!mastermode off")
+    elif text == "!mastermode off":
+        master_active = False
+        master_bias = 0
+        await update.message.reply_text("🔒 Режим мастера деактивирован.")
+    elif text.startswith("!bias"):
+        parts = text.split()
+        if len(parts) == 2:
+            try:
+                new_bias = int(parts[1])
+                if -5 <= new_bias <= 5:
+                    master_bias = new_bias
+                    await update.message.reply_text(f"⚖️ Смещение вероятности установлено: {master_bias}")
+                else:
+                    await update.message.reply_text("❌ Допустимые значения: от -5 до 5")
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат. Пример: !bias +5")
+    # Любые другие сообщения от мастера игнорируем
+
+# ========== ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ==========
 def main():
-    # Создаём приложение (бота)
     application = Application.builder().token(TOKEN).build()
 
-    # Регистрируем команды
+    # Регистрация команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("roll", roll))
+    application.add_handler(CommandHandler("myid", myid))
 
-    # Запускаем бота
+    # Обработчик скрытых команд мастера (реагирует на любые текстовые сообщения, не начинающиеся с /)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, secret_master_handler))
+
+    # Запуск
     logger.info("🚀 Бот запущен и готов к работе!")
     application.run_polling()
 
